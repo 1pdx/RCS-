@@ -1,0 +1,98 @@
+import socket
+import threading
+import re
+import numpy as np
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+
+# === 你的惯导设备TCP参数 ===
+GNSS_IP = "192.168.1.111"
+GNSS_PORT = 3004
+
+# 轨迹与航向全局数据
+positions = []
+yaws = []
+
+def parse_inspvaxa(line):
+    """只处理惯导TCP数据里的INSPVAXA协议，返回纬度、经度、航向角"""
+    try:
+        parts = line.strip().split(';')
+        if len(parts) < 2:
+            return None
+        data = parts[1].split(',')
+        if len(data) < 9:
+            return None
+        lat = float(data[2])
+        lon = float(data[3])
+        yaw = float(data[8])
+        return lat, lon, yaw
+    except Exception as e:
+        print("[解析错误]", e)
+        return None
+
+def tcp_data_receiver():
+    """独立线程：持续接收惯导数据，自动解析填入轨迹"""
+    global positions, yaws
+    pattern = re.compile(r'(#INSPVAXA[^\r\n]*)')
+    while True:
+        try:
+            print(f"[TCP] 正在连接到 {GNSS_IP}:{GNSS_PORT} ...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((GNSS_IP, GNSS_PORT))
+            print("[TCP] 已连接，开始接收轨迹数据 ...")
+            buffer = ""
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    print("[TCP] 连接断开，10秒后重连 ...")
+                    sock.close()
+                    import time; time.sleep(10)
+                    break
+                buffer += data.decode('utf-8', errors='ignore')
+                for match in pattern.finditer(buffer):
+                    line = match.group(1)
+                    result = parse_inspvaxa(line)
+                    if result:
+                        lat, lon, yaw = result
+                        positions.append((lat, lon))
+                        yaws.append(yaw)
+                        if len(positions) > 1000:  # 只保留最新1000个点
+                            positions = positions[-1000:]
+                            yaws = yaws[-1000:]
+                        print(f"【轨迹点】纬度: {lat:.8f}, 经度: {lon:.8f}, 航向: {yaw:.2f}°")
+                # 保留buffer最后一个INSPVAXA以后的内容
+                buffer = buffer[buffer.rfind('#INSPVAXA'):] if '#INSPVAXA' in buffer else ""
+        except Exception as e:
+            print(f"[TCP异常] {e}，10秒后重连 ...")
+            import time; time.sleep(10)
+
+def plot_real_time():
+    """主线程：pyqtgraph实时可视化轨迹和最新航向角"""
+    app = QtWidgets.QApplication([])
+    win = pg.GraphicsLayoutWidget(show=True, title="惯导轨迹与航向实时显示")
+    win.resize(900, 650)
+    p = win.addPlot(title="经纬度轨迹（经度X, 纬度Y）")
+    curve = p.plot([], [], pen=pg.mkPen('b', width=2), symbol='o', symbolBrush='r', symbolSize=6)
+    arrow_item = pg.ArrowItem(angle=0, tipAngle=30, baseAngle=20, headLen=30, tailLen=20, tailWidth=8, brush='g')
+    p.addItem(arrow_item)
+    p.showGrid(x=True, y=True)
+    p.setLabel('left', '纬度')
+    p.setLabel('bottom', '经度')
+
+    def update():
+        if len(positions) == 0:
+            return
+        lats, lons = zip(*positions)
+        curve.setData(lons, lats)
+        lat0, lon0 = lats[-1], lons[-1]
+        yaw = yaws[-1] if yaws else 0
+        arrow_item.setPos(lon0, lat0)
+        arrow_item.setStyle(angle=-yaw)  # pyqtgraph箭头0°朝上，惯导0°朝北，需取反
+    timer = QtCore.QTimer()
+    timer.timeout.connect(update)
+    timer.start(300)  # 每0.3秒刷新一次
+    app.exec_()
+
+if __name__ == "__main__":
+    threading.Thread(target=tcp_data_receiver, daemon=True).start()
+    plot_real_time()
