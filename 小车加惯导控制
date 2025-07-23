@@ -1,0 +1,351 @@
+import sys
+import math
+import time
+import threading
+import socket
+import re
+import numpy as np
+import can
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QLabel, QLineEdit, QGroupBox, QMessageBox, QComboBox)
+import pyqtgraph as pg
+
+# ========== 替换后的小车控制 ==========
+class ScoutMiniCarControl:
+    def __init__(self, can_channel='can0', bustype='socketcan'):
+        self.bus = can.interface.Bus(channel=can_channel, bustype=bustype, bitrate=500000)
+        self._cmd_lock = threading.Lock()
+        self._target_lin = 0.0
+        self._target_ang = 0.0
+        self._active = True
+        self._timer = threading.Thread(target=self._periodic_send, daemon=True)
+        self._timer.start()
+
+    def _periodic_send(self):
+        while self._active:
+            with self._cmd_lock:
+                lin, ang = self._target_lin, self._target_ang
+            self.send_motion_cmd(lin, ang)
+            time.sleep(0.02)  # 20ms
+
+    def set_target(self, lin, ang):
+        with self._cmd_lock:
+            self._target_lin = lin
+            self._target_ang = ang
+
+    def stop(self):
+        self.set_target(0, 0)
+        time.sleep(0.05)  # 确保停下
+
+    def move_linear(self, distance, speed=0.3):
+        duration = abs(distance / speed)
+        direction = 1 if distance >= 0 else -1
+        self.set_target(speed * direction, 0)
+        time.sleep(duration)
+        self.stop()
+
+    def move_circle(self, radius, arc_length=None, angle_deg=None, speed=0.2, clockwise=False):
+        if arc_length is None and angle_deg is None:
+            raise ValueError("arc_length或angle_deg必须指定一个")
+        if arc_length is None:
+            arc_length = 2 * math.pi * radius * (angle_deg / 360)
+        ang_speed = speed / radius
+        if clockwise:
+            ang_speed = -abs(ang_speed)
+        else:
+            ang_speed = abs(ang_speed)
+        duration = abs(arc_length / speed)
+        self.set_target(speed, ang_speed)
+        time.sleep(duration)
+        self.stop()
+
+    def send_motion_cmd(self, linear_speed=0, angular_speed=0):
+        lin = int(linear_speed * 1000)  # m/s -> mm/s
+        ang = int(angular_speed * 1000)  # rad/s -> 0.001rad/s
+        lin_bytes = lin.to_bytes(2, 'big', signed=True)
+        ang_bytes = ang.to_bytes(2, 'big', signed=True)
+        data = lin_bytes + ang_bytes + bytes(4)
+        msg = can.Message(arbitration_id=0x111, data=data, is_extended_id=False)
+        try:
+            self.bus.send(msg, timeout=0.01)
+        except Exception:
+            pass
+
+    def enable_can_control(self):
+        msg = can.Message(arbitration_id=0x421, data=[0x01], is_extended_id=False)
+        self.bus.send(msg)
+
+    def clear_all_errors(self):
+        msg = can.Message(arbitration_id=0x441, data=[0x00], is_extended_id=False)
+        self.bus.send(msg)
+
+    def close(self):
+        self._active = False
+        self.stop()
+
+# =================== Stanley轨迹控制 =======================
+def stanley_control(px, py, yaw, v, path):
+    if len(path) == 0:
+        return 0
+    dists = [math.hypot(px - p[0], py - p[1]) for p in path]
+    min_id = int(np.argmin(dists))
+    target = path[min_id]
+    if min_id < len(path)-2:
+        dx = path[min_id+1][0] - path[min_id][0]
+        dy = path[min_id+1][1] - path[min_id][1]
+        yaw_path = math.atan2(dy, dx)
+    else:
+        yaw_path = yaw
+    error = (py - target[1])*math.cos(yaw_path) - (px - target[0])*math.sin(yaw_path)
+    k = 0.7
+    yaw_diff = yaw_path - yaw
+    yaw_diff = (yaw_diff + np.pi) % (2*np.pi) - np.pi
+    steer = yaw_diff + math.atan2(k*error, max(v, 0.3))
+    steer = max(-1.0, min(1.0, steer))
+    return steer
+
+# =================== 惯导TCP接收 ===========================
+class GNSSPose:
+    def __init__(self, ip="192.168.1.111", port=3004):
+        self.positions = []
+        self.yaws = []
+        self.vs = []
+        self.lock = threading.Lock()
+        self.t = threading.Thread(target=self.tcp_data_receiver, args=(ip, port), daemon=True)
+        self.t.start()
+
+    def parse_inspvaxa(self, line):
+        try:
+            parts = line.strip().split(';')
+            data = parts[1].split(',')
+            lat = float(data[2])
+            lon = float(data[3])
+            yaw = float(data[8])
+            v = float(data[6])
+            return lat, lon, yaw, v
+        except Exception as e:
+            print("[惯导解析异常]", e)
+            return None
+
+    def tcp_data_receiver(self, ip, port):
+        pattern = re.compile(r'(#INSPVAXA[^\r\n]*)')
+        while True:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((ip, port))
+                buffer = ""
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        sock.close()
+                        time.sleep(1)
+                        break
+                    buffer += data.decode('utf-8', errors='ignore')
+                    for match in pattern.finditer(buffer):
+                        line = match.group(1)
+                        res = self.parse_inspvaxa(line)
+                        if res:
+                            lat, lon, yaw, v = res
+                            with self.lock:
+                                self.positions.append((lat, lon))
+                                self.yaws.append(yaw)
+                                self.vs.append(v)
+                                self.positions = self.positions[-1000:]
+                                self.yaws = self.yaws[-1000:]
+                                self.vs = self.vs[-1000:]
+                    buffer = buffer[buffer.rfind('#INSPVAXA'):] if '#INSPVAXA' in buffer else ""
+            except Exception as e:
+                print("[TCP异常]", e)
+                time.sleep(2)
+
+    def get_latest(self):
+        with self.lock:
+            if self.positions:
+                lat, lon = self.positions[-1]
+                yaw = self.yaws[-1]
+                v = self.vs[-1] if self.vs else 0
+                return lat, lon, yaw, v
+            else:
+                return None
+
+# =================== 路径轨迹生成工具 =====================
+def geo_offset(lat, lon, dx, dy):
+    lat_new = lat + (dy / 111320.0)
+    lon_new = lon + (dx / (40075000.0 * math.cos(math.radians(lat)) / 360.0))
+    return lat_new, lon_new
+
+def generate_line_path_by_distance(start_lat, start_lon, distance, heading_deg, repeat=1, steps=60):
+    heading_rad = math.radians(heading_deg)
+    dx = distance * math.sin(heading_rad)
+    dy = distance * math.cos(heading_rad)
+    end_lat, end_lon = geo_offset(start_lat, start_lon, dx, dy)
+    path = []
+    for i in range(repeat):
+        for t in np.linspace(0, 1, steps):
+            lat = start_lat + (end_lat - start_lat) * t
+            lon = start_lon + (end_lon - start_lon) * t
+            path.append((lat, lon))
+        for t in np.linspace(1, 0, steps):
+            lat = start_lat + (end_lat - start_lat) * t
+            lon = start_lon + (end_lon - start_lon) * t
+            path.append((lat, lon))
+    return path
+
+def generate_circle_path(center, radius_m, n_points=100, circles=1, clockwise=False):
+    path = []
+    lat0, lon0 = center
+    for c in range(circles):
+        for i in range(n_points):
+            ang = 2 * math.pi * (i / n_points)
+            if clockwise:
+                ang = -ang
+            dx = radius_m * math.cos(ang)
+            dy = radius_m * math.sin(ang)
+            lat, lon = geo_offset(lat0, lon0, dx, dy)
+            path.append((lat, lon))
+    return path
+
+# ==================== 主界面UI ============================
+class MainUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Stanley轨迹跟踪与惯导融合演示")
+        self.pose = GNSSPose()
+        self.car = ScoutMiniCarControl()
+        self.path = []
+        self.mode = "line"
+        self._active = False
+
+        layout = QVBoxLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["直线往返", "圆周运动"])
+        self.mode_combo.currentIndexChanged.connect(self.mode_changed)
+        layout.addWidget(QLabel("运动模式:"))
+        layout.addWidget(self.mode_combo)
+
+        group_line = QGroupBox("直线往返参数（只填起点、距离、角度）")
+        hl1 = QHBoxLayout()
+        self.lat1_edit = QLineEdit("28.353120")
+        self.lon1_edit = QLineEdit("112.508440")
+        self.dist_edit = QLineEdit("20")
+        self.heading_edit = QLineEdit("0")
+        self.repeat_edit = QLineEdit("2")
+        hl1.addWidget(QLabel("起点纬度:")); hl1.addWidget(self.lat1_edit)
+        hl1.addWidget(QLabel("经度:")); hl1.addWidget(self.lon1_edit)
+        hl1.addWidget(QLabel("直行距离(m):")); hl1.addWidget(self.dist_edit)
+        hl1.addWidget(QLabel("方位角(°，正北为0，顺时针)")); hl1.addWidget(self.heading_edit)
+        hl1.addWidget(QLabel("往返次数:")); hl1.addWidget(self.repeat_edit)
+        group_line.setLayout(hl1)
+        layout.addWidget(group_line)
+
+        group_circle = QGroupBox("圆周运动参数")
+        hl2 = QHBoxLayout()
+        self.center_lat_edit = QLineEdit("28.353150")
+        self.center_lon_edit = QLineEdit("112.508500")
+        self.radius_edit = QLineEdit("5.0")
+        self.circles_edit = QLineEdit("2")
+        self.cw_combo = QComboBox(); self.cw_combo.addItems(["逆时针", "顺时针"])
+        hl2.addWidget(QLabel("中心纬度:")); hl2.addWidget(self.center_lat_edit)
+        hl2.addWidget(QLabel("经度:")); hl2.addWidget(self.center_lon_edit)
+        hl2.addWidget(QLabel("半径(m):")); hl2.addWidget(self.radius_edit)
+        hl2.addWidget(QLabel("圈数:")); hl2.addWidget(self.circles_edit)
+        hl2.addWidget(QLabel("方向:")); hl2.addWidget(self.cw_combo)
+        group_circle.setLayout(hl2)
+        layout.addWidget(group_circle)
+
+        self.plotWidget = pg.PlotWidget(title="经纬度轨迹跟踪")
+        self.curve = self.plotWidget.plot([], [], pen=pg.mkPen('b', width=2), symbol='o', symbolBrush='r', symbolSize=5)
+        self.targetDot = self.plotWidget.plot([], [], pen=None, symbol='x', symbolBrush='g', symbolSize=12)
+        layout.addWidget(self.plotWidget)
+
+        self.statusLabel = QLabel("等待惯导数据...")
+        layout.addWidget(self.statusLabel)
+        hbtn = QHBoxLayout()
+        btnGen = QPushButton("生成轨迹")
+        btnGen.clicked.connect(self.gen_path)
+        btnStart = QPushButton("开始Stanley跟踪")
+        btnStart.clicked.connect(self.start_control)
+        btnStop = QPushButton("停止")
+        btnStop.clicked.connect(self.stop_car)
+        hbtn.addWidget(btnGen); hbtn.addWidget(btnStart); hbtn.addWidget(btnStop)
+        layout.addLayout(hbtn)
+        self.setLayout(layout)
+
+        self.timer = pg.QtCore.QTimer()
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(500)
+
+        self.mode_changed(0)
+
+    def mode_changed(self, idx):
+        self.mode = "line" if idx == 0 else "circle"
+
+    def gen_path(self):
+        try:
+            if self.mode == "line":
+                lat1 = float(self.lat1_edit.text())
+                lon1 = float(self.lon1_edit.text())
+                distance = float(self.dist_edit.text())
+                heading = float(self.heading_edit.text())
+                repeat = int(self.repeat_edit.text())
+                self.path = generate_line_path_by_distance(lat1, lon1, distance, heading, repeat=repeat, steps=60)
+                heading_rad = math.radians(heading)
+                dx = distance * math.sin(heading_rad)
+                dy = distance * math.cos(heading_rad)
+                end_lat, end_lon = geo_offset(lat1, lon1, dx, dy)
+                self.statusLabel.setText(f"轨迹已生成，共{len(self.path)}点。自动终点：({end_lat:.6f}, {end_lon:.6f})")
+            else:
+                center_lat = float(self.center_lat_edit.text())
+                center_lon = float(self.center_lon_edit.text())
+                radius = float(self.radius_edit.text())
+                circles = int(self.circles_edit.text())
+                cw = self.cw_combo.currentIndex() == 1
+                self.path = generate_circle_path((center_lat, center_lon), radius, n_points=100, circles=circles, clockwise=cw)
+                self.statusLabel.setText(f"轨迹已生成，共{len(self.path)}点。")
+        except Exception as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+
+    def update_plot(self):
+        with self.pose.lock:
+            if self.pose.positions:
+                lats, lons = zip(*self.pose.positions)
+                self.curve.setData(lons, lats)
+            if self.path:
+                path_lons = [p[1] for p in self.path]
+                path_lats = [p[0] for p in self.path]
+                self.targetDot.setData(path_lons, path_lats)
+
+    def start_control(self):
+        if not self.path:
+            self.gen_path()
+        if self._active:
+            return
+        self._active = True
+        threading.Thread(target=self.control_loop, daemon=True).start()
+
+    def stop_car(self):
+        self._active = False
+        self.car.stop()
+
+    def control_loop(self):
+        while self._active:
+            state = self.pose.get_latest()
+            if state and self.path:
+                lat, lon, yaw, v = state
+                steer = stanley_control(lon, lat, math.radians(yaw), v, [(p[1], p[0]) for p in self.path])
+                self.car.set_target(0.5, steer)
+                self.statusLabel.setText(f"当前:({lat:.6f},{lon:.6f}) 航向:{yaw:.1f}° 控制: steer={steer:.2f}")
+            else:
+                self.statusLabel.setText("惯导/路径数据缺失")
+            time.sleep(0.15)
+
+    def closeEvent(self, event):
+        self._active = False
+        self.car.close()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = MainUI()
+    win.show()
+    sys.exit(app.exec_())
