@@ -1,0 +1,173 @@
+import sys
+import math
+import time
+import threading
+import can
+from PyQt5.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QGroupBox, QMessageBox
+
+class ScoutMiniCarControl:
+    def __init__(self, can_channel='can0', bustype='socketcan'):
+        self.bus = can.interface.Bus(channel=can_channel, bustype=bustype, bitrate=500000)
+        self._cmd_lock = threading.Lock()
+        self._target_lin = 0.0
+        self._target_ang = 0.0
+        self._active = True
+        self._timer = threading.Thread(target=self._periodic_send, daemon=True)
+        self._timer.start()
+
+    def _periodic_send(self):
+        while self._active:
+            with self._cmd_lock:
+                lin, ang = self._target_lin, self._target_ang
+            self.send_motion_cmd(lin, ang)
+            time.sleep(0.02)  # 20ms
+
+    def set_target(self, lin, ang):
+        with self._cmd_lock:
+            self._target_lin = lin
+            self._target_ang = ang
+
+    def stop(self):
+        self.set_target(0, 0)
+        time.sleep(0.05)  # 确保停下
+
+    def move_linear(self, distance, speed=0.3):
+        duration = abs(distance / speed)
+        direction = 1 if distance >= 0 else -1
+        self.set_target(speed * direction, 0)
+        time.sleep(duration)
+        self.stop()
+
+    def move_circle(self, radius, arc_length=None, angle_deg=None, speed=0.2, clockwise=False):
+        if arc_length is None and angle_deg is None:
+            raise ValueError("arc_length或angle_deg必须指定一个")
+        if arc_length is None:
+            arc_length = 2 * math.pi * radius * (angle_deg / 360)
+        ang_speed = speed / radius
+        if clockwise:
+            ang_speed = -abs(ang_speed)
+        else:
+            ang_speed = abs(ang_speed)
+        duration = abs(arc_length / speed)
+        self.set_target(speed, ang_speed)
+        time.sleep(duration)
+        self.stop()
+
+    def send_motion_cmd(self, linear_speed=0, angular_speed=0):
+        lin = int(linear_speed * 1000)  # m/s -> mm/s
+        ang = int(angular_speed * 1000)  # rad/s -> 0.001rad/s
+        lin_bytes = lin.to_bytes(2, 'big', signed=True)
+        ang_bytes = ang.to_bytes(2, 'big', signed=True)
+        data = lin_bytes + ang_bytes + bytes(4)
+        msg = can.Message(arbitration_id=0x111, data=data, is_extended_id=False)
+        try:
+            self.bus.send(msg, timeout=0.01)
+        except Exception:
+            pass
+
+    def enable_can_control(self):
+        msg = can.Message(arbitration_id=0x421, data=[0x01], is_extended_id=False)
+        self.bus.send(msg)
+
+    def clear_all_errors(self):
+        msg = can.Message(arbitration_id=0x441, data=[0x00], is_extended_id=False)
+        self.bus.send(msg)
+
+    def close(self):
+        self._active = False
+        self.stop()
+
+# ------- UI 部分基本不变，只是关闭时加 car.close() -------
+class CarControlUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SCOUT MINI 小车控制界面")
+        self.car = ScoutMiniCarControl()
+        self.car.clear_all_errors()
+        time.sleep(0.1)
+        self.car.enable_can_control()
+        time.sleep(0.1)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+        group_linear = QGroupBox("直线运动")
+        hbox1 = QHBoxLayout()
+        self.dist_edit = QLineEdit("1.0")
+        self.speed_edit = QLineEdit("0.3")
+        btn_fwd = QPushButton("前进")
+        btn_bwd = QPushButton("后退")
+        hbox1.addWidget(QLabel("距离(m):"))
+        hbox1.addWidget(self.dist_edit)
+        hbox1.addWidget(QLabel("速度(m/s):"))
+        hbox1.addWidget(self.speed_edit)
+        hbox1.addWidget(btn_fwd)
+        hbox1.addWidget(btn_bwd)
+        group_linear.setLayout(hbox1)
+        btn_fwd.clicked.connect(self.forward_clicked)
+        btn_bwd.clicked.connect(self.backward_clicked)
+
+        group_circle = QGroupBox("圆周运动")
+        hbox2 = QHBoxLayout()
+        self.radius_edit = QLineEdit("1.0")
+        self.angle_edit = QLineEdit("360")
+        self.cir_speed_edit = QLineEdit("0.2")
+        btn_circle_cw = QPushButton("顺时针")
+        btn_circle_ccw = QPushButton("逆时针")
+        hbox2.addWidget(QLabel("半径(m):"))
+        hbox2.addWidget(self.radius_edit)
+        hbox2.addWidget(QLabel("角度(度):"))
+        hbox2.addWidget(self.angle_edit)
+        hbox2.addWidget(QLabel("切线速度(m/s):"))
+        hbox2.addWidget(self.cir_speed_edit)
+        hbox2.addWidget(btn_circle_cw)
+        hbox2.addWidget(btn_circle_ccw)
+        group_circle.setLayout(hbox2)
+        btn_circle_cw.clicked.connect(lambda: self.circle_clicked(clockwise=True))
+        btn_circle_ccw.clicked.connect(lambda: self.circle_clicked(clockwise=False))
+
+        btn_stop = QPushButton("停止")
+        btn_stop.clicked.connect(self.stop_clicked)
+        
+        layout.addWidget(group_linear)
+        layout.addWidget(group_circle)
+        layout.addWidget(btn_stop)
+        self.setLayout(layout)
+
+    def forward_clicked(self):
+        try:
+            d = float(self.dist_edit.text())
+            v = float(self.speed_edit.text())
+            threading.Thread(target=self.car.move_linear, args=(abs(d), v), daemon=True).start()
+        except Exception as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+
+    def backward_clicked(self):
+        try:
+            d = float(self.dist_edit.text())
+            v = float(self.speed_edit.text())
+            threading.Thread(target=self.car.move_linear, args=(-abs(d), v), daemon=True).start()
+        except Exception as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+
+    def circle_clicked(self, clockwise):
+        try:
+            r = float(self.radius_edit.text())
+            angle = float(self.angle_edit.text())
+            v = float(self.cir_speed_edit.text())
+            threading.Thread(target=self.car.move_circle, kwargs=dict(radius=r, angle_deg=angle, speed=v, clockwise=clockwise), daemon=True).start()
+        except Exception as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+
+    def stop_clicked(self):
+        threading.Thread(target=self.car.stop, daemon=True).start()
+
+    def closeEvent(self, event):
+        self.car.close()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = CarControlUI()
+    win.show()
+    sys.exit(app.exec_())
