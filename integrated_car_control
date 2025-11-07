@@ -1,0 +1,997 @@
+"""
+Integrated control program for Scout Mini car with GNSS/IMU and radar processing.
+
+This script combines car control via CAN bus, GNSS/IMU pose reception via UDP,
+radar cluster parsing with a Kalman filter for target tracking, and a PyQt5-based
+GUI for path configuration and visualization.  The code has been reorganized
+into clear sections with descriptive comments to improve readability and
+maintainability while preserving the original functionality.
+
+Key features:
+
+* **Car control** via CAN2.0B at 500 kbps, with support for setting linear and
+  angular velocities, enabling CAN control, and clearing errors.
+* **GNSS/IMU pose reception** over UDP. A configurable activation message
+  triggers the device to start streaming pose data (INSPVAXA messages).
+* **Radar processing** that parses ARS40x cluster general messages to extract
+  distance and RCS values, visualises them using PyQtGraph, and applies a
+  simple Kalman filter to track the most salient target.  When any target
+  appears within a configurable minimum distance, the car performs an
+  emergency stop.
+* **Path generation** utilities for generating straight-line round-trip and
+  circular trajectories from geographic coordinates.
+* **Stanley controller** for trajectory tracking.
+* **Electronic geofence** around the generated path: if the vehicle position
+  leaves this boundary (with a configurable margin), control stops and an
+  emergency message is displayed.
+* **GUI** built with PyQt5 that allows the user to choose motion mode,
+  configure parameters, generate a path, and start/stop control.  The GUI
+  displays the planned path, current position, radar returns, and status.
+
+This program supersedes earlier versions of separate radar and GNSS control
+scripts by integrating all functionality into a single coherent module.
+"""
+
+from __future__ import annotations
+
+import sys
+import math
+import time
+import threading
+import socket
+import re
+from typing import Optional, List, Tuple
+
+import numpy as np
+from PyQt5.QtCore import QObject, pyqtSignal, Qt
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLabel, QLineEdit, QGroupBox, QComboBox, QMessageBox
+)
+import pyqtgraph as pg
+import can
+
+###############################################################################
+# Configuration constants
+###############################################################################
+
+# CAN bus configuration for the Scout Mini car. According to the user manual the
+# chassis exposes a CAN2.0B interface operating at 500 kbps and supports
+# commands for linear and rotational velocities【793535744218292†L493-L500】.
+CAN_CHANNEL = 'can0'
+CAN_BUSTYPE = 'socketcan'
+CAN_BITRATE = 500_000
+
+# Radar safety threshold in metres. If a detected target is closer than this
+# distance, the car will perform an emergency stop.
+RADAR_EMERGENCY_DISTANCE = 1.0
+
+# Geofence margin added around the planned path in degrees latitude/longitude.
+# Approximately 0.00001 degrees ≈ 1.11 m.  This margin prevents the vehicle
+# stopping due to small GPS noise when near the boundary.
+GEOFENCE_MARGIN = 0.00005  # ≈ 5.5 m
+
+# Activation message sent via UDP to trigger the GNSS/IMU to start streaming
+# INSPVAXA messages. Set to None if your device does not require activation.
+GNSS_ACTIVATION_MESSAGE: Optional[str] = '#ACTIVATE'
+
+# UDP receive timeout in seconds. Adjust based on expected update rate of your
+# GNSS/IMU device.
+GNSS_TIMEOUT = 5.0
+
+###############################################################################
+# Car control via CAN
+###############################################################################
+
+class ScoutMiniCarControl:
+    """
+    Provides a simple interface to control a Scout Mini car over CAN bus.
+
+    The class periodically sends motion commands in a background thread.  Users
+    can set target linear and angular velocities with `set_target()`, and call
+    `stop()` to zero out velocities.  Additional methods allow enabling
+    external control and clearing error states.
+    """
+
+    def __init__(self, can_channel: str = CAN_CHANNEL, bustype: str = CAN_BUSTYPE,
+                 bitrate: int = CAN_BITRATE) -> None:
+        try:
+            self.bus = can.interface.Bus(channel=can_channel, bustype=bustype, bitrate=bitrate)
+            print(f"CAN bus initialised on {can_channel} at {bitrate} bps")
+        except Exception as e:
+            print(f"CAN bus initialisation failed: {e}")
+            self.bus = None
+        self._cmd_lock = threading.Lock()
+        self._target_lin = 0.0
+        self._target_ang = 0.0
+        self._active = True
+        # Start periodic sender thread
+        self._timer = threading.Thread(target=self._periodic_send, daemon=True)
+        self._timer.start()
+
+    def _periodic_send(self) -> None:
+        """Periodically send the current velocity command to the CAN bus."""
+        while self._active:
+            with self._cmd_lock:
+                lin, ang = self._target_lin, self._target_ang
+            self._send_motion_cmd(lin, ang)
+            time.sleep(0.02)  # 20 ms period
+
+    def set_target(self, lin: float, ang: float) -> None:
+        """Set desired linear and angular velocities (m/s and rad/s)."""
+        with self._cmd_lock:
+            self._target_lin = lin
+            self._target_ang = ang
+
+    def stop(self) -> None:
+        """Stop the car by zeroing velocities and briefly sleeping to ensure the command is sent."""
+        self.set_target(0.0, 0.0)
+        time.sleep(0.05)
+
+    def move_linear(self, distance: float, speed: float = 0.3) -> None:
+        """Move forward/backwards a certain distance at a given speed (blocking)."""
+        duration = abs(distance / speed)
+        direction = 1.0 if distance >= 0 else -1.0
+        self.set_target(speed * direction, 0.0)
+        time.sleep(duration)
+        self.stop()
+
+    def move_circle(self, radius: float, arc_length: Optional[float] = None,
+                    angle_deg: Optional[float] = None, speed: float = 0.2,
+                    clockwise: bool = False) -> None:
+        """Move along a circular arc with given radius and arc length or angle."""
+        if arc_length is None and angle_deg is None:
+            raise ValueError("Either arc_length or angle_deg must be provided")
+        if arc_length is None:
+            arc_length = 2 * math.pi * radius * (angle_deg / 360.0)
+        ang_speed = speed / radius
+        ang_speed = -abs(ang_speed) if clockwise else abs(ang_speed)
+        duration = abs(arc_length / speed)
+        self.set_target(speed, ang_speed)
+        time.sleep(duration)
+        self.stop()
+
+    def _send_motion_cmd(self, linear_speed: float, angular_speed: float) -> None:
+        """Send a motion command frame over CAN bus."""
+        if self.bus is None:
+            return
+        lin = int(linear_speed * 1000)  # m/s → mm/s
+        ang = int(angular_speed * 1000)  # rad/s → 0.001 rad/s
+        lin_bytes = lin.to_bytes(2, 'big', signed=True)
+        ang_bytes = ang.to_bytes(2, 'big', signed=True)
+        data = lin_bytes + ang_bytes + bytes(4)
+        msg = can.Message(arbitration_id=0x111, data=data, is_extended_id=False)
+        try:
+            self.bus.send(msg, timeout=0.01)
+        except Exception:
+            # Ignore send failure, possibly due to bus congestion
+            pass
+
+    def enable_can_control(self) -> None:
+        """Send a frame enabling external CAN control."""
+        if self.bus is None:
+            return
+        msg = can.Message(arbitration_id=0x421, data=[0x01], is_extended_id=False)
+        self.bus.send(msg)
+
+    def clear_all_errors(self) -> None:
+        """Send a frame clearing all error states."""
+        if self.bus is None:
+            return
+        msg = can.Message(arbitration_id=0x441, data=[0x00], is_extended_id=False)
+        self.bus.send(msg)
+
+    def close(self) -> None:
+        """Shut down the periodic sender and stop the car."""
+        self._active = False
+        self.stop()
+        if self.bus is not None:
+            try:
+                self.bus.shutdown()
+            except Exception:
+                pass
+
+###############################################################################
+# GNSS/IMU pose reception over UDP
+###############################################################################
+
+class GNSSPose:
+    """
+    Receive and parse INSPVAXA pose messages from a GNSS/IMU device over UDP.
+
+    Upon initialisation, a background thread is started which opens a UDP
+    socket, connects to the specified IP/port, optionally sends an activation
+    message, and then enters a loop receiving data.  When INSPVAXA messages
+    matching the regular expression are found, latitude, longitude, yaw and
+    speed are extracted and cached.  Thread-safe access is provided via a
+    lock.  If no data has been received yet, default values are returned.
+    """
+
+    def __init__(self, ip: str = '192.168.1.111', port: int = 3004,
+                 activation_message: Optional[str] = GNSS_ACTIVATION_MESSAGE,
+                 timeout: float = GNSS_TIMEOUT) -> None:
+        self.positions: List[Tuple[float, float]] = []
+        self.yaws: List[float] = []
+        self.vs: List[float] = []
+        self.lock = threading.Lock()
+        # Default values used until data is received
+        self.default_lat = 28.353120
+        self.default_lon = 112.508440
+        self.default_yaw = 0.0
+        self.default_v = 0.5
+        self._thread = threading.Thread(target=self._udp_data_receiver,
+                                        args=(ip, port, activation_message, timeout),
+                                        daemon=True)
+        self._thread.start()
+
+    def _parse_inspvaxa(self, line: str) -> Optional[Tuple[float, float, float, float]]:
+        """Parse a single INSPVAXA line into (lat, lon, yaw, v)."""
+        try:
+            parts = line.strip().split(';')
+            data = parts[1].split(',')
+            lat = float(data[2])
+            lon = float(data[3])
+            yaw = float(data[8])
+            v = float(data[6])
+            return lat, lon, yaw, v
+        except Exception as e:
+            print("[GNSS parse error]", e)
+            return None
+
+    def _udp_data_receiver(self, ip: str, port: int, activation_message: Optional[str], timeout: float) -> None:
+        pattern = re.compile(r'(#INSPVAXA[^\r\n]*)')
+        while True:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(timeout)
+                sock.connect((ip, port))
+                if activation_message:
+                    try:
+                        sock.send(activation_message.encode('utf-8'))
+                        print(f"Sent activation message to {ip}:{port}: {activation_message}")
+                    except Exception as e:
+                        print(f"[GNSS activation failed] {e}")
+                buffer = ""
+                while True:
+                    try:
+                        data = sock.recv(4096)
+                        if not data:
+                            # UDP should not return empty data; treat as error
+                            break
+                        buffer += data.decode('utf-8', errors='ignore')
+                        for match in pattern.finditer(buffer):
+                            line = match.group(1)
+                            res = self._parse_inspvaxa(line)
+                            if res:
+                                lat, lon, yaw, v = res
+                                with self.lock:
+                                    self.positions.append((lat, lon))
+                                    self.yaws.append(yaw)
+                                    self.vs.append(v)
+                                    # Limit history length
+                                    self.positions = self.positions[-1000:]
+                                    self.yaws = self.yaws[-1000:]
+                                    self.vs = self.vs[-1000:]
+                        # Keep the last partial INSPVAXA frame
+                        idx = buffer.rfind('#INSPVAXA')
+                        buffer = buffer[idx:] if idx != -1 else ""
+                    except socket.timeout:
+                        print("[GNSS timeout]")
+                        continue
+                    except Exception as e:
+                        print(f"[GNSS receive error] {e}")
+                        break
+            except Exception as e:
+                print(f"[GNSS connection error] {e}")
+            # Wait before retrying if connection or reception failed
+            time.sleep(2.0)
+
+    def get_latest(self) -> Tuple[float, float, float, float]:
+        """Return the most recent (lat, lon, yaw, v), or default values if none."""
+        with self.lock:
+            if self.positions:
+                lat, lon = self.positions[-1]
+                yaw = self.yaws[-1]
+                v = self.vs[-1] if self.vs else 0.0
+                return lat, lon, yaw, v
+            return self.default_lat, self.default_lon, self.default_yaw, self.default_v
+
+###############################################################################
+# Radar parsing and visualisation
+###############################################################################
+
+def parse_cluster_general(data: bytes) -> Tuple[int, float, float]:
+    """
+    Parse a raw 8‑byte `cluster_general` message from the ARS40x radar.
+
+    The message layout encodes a cluster ID, distance (13 bits with 0.2 m
+    resolution), and RCS (7 bits with 0.5 dBsm resolution).  The distance is
+    converted to metres and offset by −500 m to align with a forward‑looking
+    coordinate frame.  Returns `(cluster_id, dist_x, rcs)`.
+    """
+    cluster_id = data[0]
+    dist_raw = ((data[1] << 5) | (data[2] >> 3)) & 0x1FFF
+    dist_x = dist_raw * 0.2 - 500.0
+    rcs_raw = data[7] & 0x7F
+    rcs = rcs_raw * 0.5 - 64.0
+    return cluster_id, dist_x, rcs
+
+
+class SimpleKalman:
+    """A simple 1D position/velocity Kalman filter used for radar target smoothing."""
+
+    def __init__(self, x0: float, v0: float = 0.0) -> None:
+        self.x = np.array([x0, v0], dtype=np.float64)
+        self.P = np.eye(2)
+        # State transition for dt=0.1 s
+        self.F = np.array([[1.0, 0.1], [0.0, 1.0]])
+        self.Q = np.eye(2) * 0.01
+        self.H = np.array([[1.0, 0.0]])
+        self.R = np.array([[0.2]])
+
+    def predict(self) -> None:
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def update(self, z: float) -> None:
+        y = np.array([[z]]) - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + (K @ y).reshape(2)
+        self.P = (np.eye(2) - K @ self.H) @ self.P
+
+    def value(self) -> float:
+        return float(self.x[0])
+
+
+class RadarRCSPlot(pg.PlotWidget):
+    """
+    Display radar cluster returns and track the most significant target.
+
+    This class handles accumulation of radar targets, automatically selects
+    the target with the highest RCS for Kalman tracking when no target is
+    currently tracked, and draws scatter plots and target annotations.  The
+    `get_tracked_info` method returns the current estimated distance and RCS
+    of the tracked target, if any.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setBackground('w')
+        self.showGrid(x=True, y=True, alpha=0.3)
+        self.setLabel('left', 'RCS (dBsm)')
+        self.setLabel('bottom', '前方距离 (m)')
+        self.setXRange(0, 50)
+        self.setYRange(-40, 20)
+        self.scatter = pg.ScatterPlotItem(size=10, brush=pg.mkBrush(0, 0, 255, 150))
+        self.addItem(self.scatter)
+        self.text_items: List[pg.TextItem] = []
+        self.targets: List[Tuple[float, float, int]] = []  # (dist_x, rcs, id)
+        self.tracked: Optional[SimpleKalman] = None
+        self.tracked_rcs: Optional[float] = None
+        self.track_active = False
+        self.fixed_marker: Optional[pg.ScatterPlotItem] = None
+        self.track_history: List[Tuple[float, float]] = []
+        self.selected_id: Optional[int] = None
+        self.scatter.sigClicked.connect(self._on_scatter_clicked)
+
+    def add_target(self, dist_x: float, rcs: float, cluster_id: int) -> None:
+        """Add a radar target if it lies within the 0–50 m forward field."""
+        if 0.0 <= dist_x <= 50.0:
+            self.targets.append((dist_x, rcs, cluster_id))
+            if len(self.targets) > 100:
+                self.targets.pop(0)
+
+    def _on_scatter_clicked(self, plot, points) -> None:
+        """Handle mouse clicks on scatter points by starting to track that target."""
+        if not points:
+            return
+        pt = points[0]
+        dist = pt.pos().x()
+        rcs = pt.pos().y()
+        for t in self.targets:
+            if abs(t[0] - dist) < 0.5 and abs(t[1] - rcs) < 0.5:
+                self.start_tracking(dist, rcs, t[2])
+                return
+
+    def start_tracking(self, dist_x: float, rcs: float, cluster_id: Optional[int] = None) -> None:
+        """Begin Kalman tracking on the specified target."""
+        self.tracked = SimpleKalman(dist_x)
+        self.tracked_rcs = rcs
+        self.track_active = True
+        self.track_history = [(dist_x, rcs)]
+        self.selected_id = cluster_id
+
+    def stop_tracking(self) -> None:
+        """Stop any ongoing target tracking."""
+        self.tracked = None
+        self.track_active = False
+        self.track_history = []
+
+    def _step_tracking(self) -> None:
+        """Perform one prediction/update step of the Kalman filter based on target association."""
+        if not self.track_active or self.tracked is None:
+            return
+        cur_dist = self.tracked.value()
+        min_dist = float('inf')
+        target: Optional[Tuple[float, float, int]] = None
+        # If a specific ID is selected, match only that ID
+        if self.selected_id is not None:
+            for t in self.targets:
+                if t[2] == self.selected_id:
+                    d = abs(t[0] - cur_dist)
+                    if d < min_dist:
+                        min_dist = d
+                        target = t
+            if target is None:
+                # No matching target; predict only
+                self.tracked.predict()
+                self.track_history.append((self.tracked.value(), self.tracked_rcs))
+                self.track_history = self.track_history[-30:]
+                return
+        else:
+            for t in self.targets:
+                d = abs(t[0] - cur_dist)
+                if d < min_dist:
+                    min_dist = d
+                    target = t
+        # Update if a nearby target is found; otherwise just predict
+        if target is not None and min_dist < 5.0:
+            self.tracked.predict()
+            self.tracked.update(target[0])
+            self.tracked_rcs = target[1]
+        else:
+            self.tracked.predict()
+        if self.tracked_rcs is not None:
+            self.track_history.append((self.tracked.value(), self.tracked_rcs))
+            self.track_history = self.track_history[-30:]
+
+    def flush_display(self) -> None:
+        """
+        Refresh the scatter and text annotations.  Auto-select the strongest
+        target for tracking if none is currently active.
+        """
+        # Clear previous markers
+        if self.fixed_marker is not None:
+            self.removeItem(self.fixed_marker)
+            self.fixed_marker = None
+        # Clear previous text labels
+        for t in self.text_items:
+            self.removeItem(t)
+        self.text_items.clear()
+        # If no targets, clear scatter and return
+        if not self.targets:
+            self.scatter.setData([], [])
+            return
+        # Populate scatter spots
+        spots = [
+            {'pos': (x, y), 'data': cid, 'brush': pg.mkBrush(0, 0, 255, 150)}
+            for x, y, cid in self.targets
+        ]
+        self.scatter.setData(spots)
+        # Draw cluster ID labels
+        for dist, rcs, cid in self.targets:
+            text = pg.TextItem(str(cid), anchor=(0.5, 0.5), color=(255, 0, 0))
+            text.setPos(dist, rcs)
+            self.addItem(text)
+            self.text_items.append(text)
+        # Automatically start tracking the highest RCS target if none is active
+        if not self.track_active and self.targets:
+            best = max(self.targets, key=lambda t: t[1])
+            self.start_tracking(best[0], best[1], best[2])
+        # Update Kalman and draw tracking marker
+        if self.track_active and self.tracked is not None:
+            self._step_tracking()
+            tdist = self.tracked.value()
+            trcs = self.tracked_rcs
+            if trcs is not None:
+                self.fixed_marker = pg.ScatterPlotItem(
+                    [tdist], [trcs], size=22, brush=pg.mkBrush(255, 0, 0, 200)
+                )
+                self.addItem(self.fixed_marker)
+                # Draw dashed line of track history
+                if len(self.track_history) >= 2:
+                    xs, ys = zip(*self.track_history)
+                    traj = pg.PlotCurveItem(xs, ys, pen=pg.mkPen('r', width=2, style=Qt.DashLine))
+                    # Remove previous track
+                    if hasattr(self, '_last_traj') and self._last_traj is not None:
+                        try:
+                            self.removeItem(self._last_traj)
+                        except Exception:
+                            pass
+                    self._last_traj = traj
+                    self.addItem(traj)
+
+    def get_tracked_info(self) -> Optional[Tuple[float, float]]:
+        """
+        Return the current estimated distance and RCS of the tracked target.
+        Returns None if no target is currently tracked.
+        """
+        if self.track_active and self.tracked is not None and self.tracked_rcs is not None:
+            return self.tracked.value(), self.tracked_rcs
+        return None
+
+
+class RadarSignal(QObject):
+    """Qt signal class used to dispatch new radar cluster messages."""
+    new_cluster = pyqtSignal(int, float, float)  # cluster_id, dist_x, rcs
+
+
+class RadarThread(threading.Thread):
+    """
+    Background thread reading CAN frames and emitting radar clusters.
+
+    This thread listens on a CAN interface for frames with arbitration ID
+    corresponding to the radar's cluster_general messages (0x701) and
+    emits parsed cluster data via a Qt signal.
+    """
+
+    CLUSTER_GENERAL_ID = 0x701
+
+    def __init__(self, signal: RadarSignal, can_iface: str = CAN_CHANNEL) -> None:
+        super().__init__(daemon=True)
+        self.signal = signal
+        self.running = True
+        self.can_iface = can_iface
+        self.bus: Optional[can.interface.Bus] = None
+
+    def run(self) -> None:
+        print("Radar thread starting…")
+        try:
+            self.bus = can.interface.Bus(
+                channel=self.can_iface,
+                bustype=CAN_BUSTYPE,
+                bitrate=CAN_BITRATE
+            )
+            print(f"Connected to CAN interface {self.can_iface}")
+            while self.running:
+                msg = self.bus.recv(timeout=0.05)
+                if msg and msg.arbitration_id == self.CLUSTER_GENERAL_ID:
+                    try:
+                        cluster_id, dist_x, rcs = parse_cluster_general(msg.data)
+                        self.signal.new_cluster.emit(cluster_id, dist_x, rcs)
+                    except Exception as e:
+                        print(f"[Radar parse error] {e}")
+        except Exception as e:
+            print(f"[Radar CAN init failed] {e}")
+            # Emit a dummy message to indicate failure
+            self.signal.new_cluster.emit(-1, 0.0, 0.0)
+        finally:
+            if self.bus is not None:
+                try:
+                    self.bus.shutdown()
+                except Exception:
+                    pass
+            print("Radar thread stopped")
+
+###############################################################################
+# Path generation utilities
+###############################################################################
+
+def geo_offset(lat: float, lon: float, dx: float, dy: float) -> Tuple[float, float]:
+    """
+    Compute a new latitude/longitude by applying planar offsets (dx, dy).
+
+    Uses a simple equirectangular approximation valid for small distances.
+    """
+    lat_new = lat + (dy / 111_320.0)
+    lon_new = lon + (dx / (40_075_000.0 * math.cos(math.radians(lat)) / 360.0))
+    return lat_new, lon_new
+
+
+def generate_line_path_by_distance(start_lat: float, start_lon: float, distance: float,
+                                   heading_deg: float, repeat: int = 1, steps: int = 60) -> List[Tuple[float, float]]:
+    """
+    Generate a back-and-forth straight line path.
+
+    Parameters
+    ----------
+    start_lat, start_lon : float
+        Starting latitude and longitude.
+    distance : float
+        Distance to travel in metres.
+    heading_deg : float
+        Heading angle in degrees. 0° means north, positive clockwise.
+    repeat : int
+        Number of round trips to perform.
+    steps : int
+        Number of discretisation points per leg.
+    """
+    heading_rad = math.radians(heading_deg)
+    dx = distance * math.sin(heading_rad)
+    dy = distance * math.cos(heading_rad)
+    end_lat, end_lon = geo_offset(start_lat, start_lon, dx, dy)
+    path: List[Tuple[float, float]] = []
+    for _ in range(repeat):
+        for t in np.linspace(0.0, 1.0, steps):
+            lat = start_lat + (end_lat - start_lat) * t
+            lon = start_lon + (end_lon - start_lon) * t
+            path.append((lat, lon))
+        for t in np.linspace(1.0, 0.0, steps):
+            lat = start_lat + (end_lat - start_lat) * t
+            lon = start_lon + (end_lon - start_lon) * t
+            path.append((lat, lon))
+    return path
+
+
+def generate_circle_path(center: Tuple[float, float], radius_m: float, n_points: int = 100,
+                         circles: int = 1, clockwise: bool = False) -> List[Tuple[float, float]]:
+    """Generate a circular path around `center` with given radius and number of circles."""
+    path: List[Tuple[float, float]] = []
+    lat0, lon0 = center
+    for _ in range(circles):
+        for i in range(n_points):
+            ang = 2.0 * math.pi * (i / n_points)
+            if clockwise:
+                ang = -ang
+            dx = radius_m * math.cos(ang)
+            dy = radius_m * math.sin(ang)
+            lat, lon = geo_offset(lat0, lon0, dx, dy)
+            path.append((lat, lon))
+    return path
+
+
+###############################################################################
+# Stanley controller
+###############################################################################
+
+def stanley_control(px: float, py: float, yaw: float, v: float,
+                    path: List[Tuple[float, float]]) -> float:
+    """
+    Stanley controller for steering angle computation.
+
+    Parameters
+    ----------
+    px, py : float
+        Current vehicle position (x, y).  In this implementation we pass
+        (lon, lat) as (px, py) to align with path coordinate order.
+    yaw : float
+        Current heading angle in radians.
+    v : float
+        Current speed in m/s.
+    path : list of (x, y) tuples
+        Reference path coordinates (lon, lat) pairs.
+
+    Returns
+    -------
+    steer : float
+        Steering angle command in range [-1.0, 1.0].
+    """
+    if not path:
+        return 0.0
+    dists = [math.hypot(px - p[0], py - p[1]) for p in path]
+    min_id = int(np.argmin(dists))
+    target = path[min_id]
+    # Compute path yaw
+    if min_id < len(path) - 2:
+        dx = path[min_id + 1][0] - path[min_id][0]
+        dy = path[min_id + 1][1] - path[min_id][1]
+        yaw_path = math.atan2(dy, dx)
+    else:
+        yaw_path = yaw
+    # Cross-track error
+    error = (py - target[1]) * math.cos(yaw_path) - (px - target[0]) * math.sin(yaw_path)
+    k = 1.5  # Gain parameter
+    yaw_diff = (yaw_path - yaw + math.pi) % (2 * math.pi) - math.pi
+    steer = yaw_diff + math.atan2(k * error, max(v, 0.3))
+    return max(-1.0, min(1.0, steer))
+
+###############################################################################
+# Main GUI application
+###############################################################################
+
+class MainUI(QWidget):
+    """
+    Main application window integrating GNSS pose, radar display and car control.
+
+    The user can select a motion mode (straight line or circle), input
+    parameters, generate a path, and start/stop the controller.  The GUI
+    displays the planned path, actual GPS track, radar returns, and status.
+    Electronic geofence and radar safety checks trigger emergency stops.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Scout Mini Trajectory Tracking with Radar")
+        self.setGeometry(100, 100, 1400, 800)
+        # Pose and control
+        self.pose = GNSSPose()
+        self.car = ScoutMiniCarControl()
+        # Path related
+        self.path: List[Tuple[float, float]] = []
+        self.path_points: List[Tuple[float, float]] = []
+        self.actual_points: List[Tuple[float, float]] = []
+        self.mode: str = 'line'
+        self._active: bool = False
+        # Geofence boundaries (min_lat, max_lat, min_lon, max_lon)
+        self.geofence_bounds: Optional[Tuple[float, float, float, float]] = None
+        # Radar display
+        self.radar_signal = RadarSignal()
+        self.radar_plot = RadarRCSPlot()
+        self.radar_signal.new_cluster.connect(self._on_new_cluster)
+        self.radar_thread = RadarThread(self.radar_signal)
+        self.radar_thread.start()
+        # UI elements
+        self._build_ui()
+        # Periodic timers for updating plots
+        self.timer = pg.QtCore.QTimer()
+        self.timer.timeout.connect(self._update_plot)
+        self.timer.timeout.connect(self._update_radar_plot)
+        self.timer.start(200)
+        # Set initial mode
+        self._mode_changed(0)
+
+    ###########################################################################
+    # UI construction
+    ###########################################################################
+
+    def _build_ui(self) -> None:
+        """Assemble the UI layout with controls, plots and status labels."""
+        # Configuration layout
+        config_layout = QGridLayout()
+        config_layout.addWidget(QLabel("运动模式:"), 0, 0)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["直线往返", "圆周运动"])
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        config_layout.addWidget(self.mode_combo, 0, 1)
+        # Straight line parameters
+        config_layout.addWidget(QLabel("直行距离(m):"), 1, 0)
+        self.dist_edit = QLineEdit("20")
+        config_layout.addWidget(self.dist_edit, 1, 1)
+        config_layout.addWidget(QLabel("往返次数:"), 1, 2)
+        self.repeat_edit = QLineEdit("2")
+        config_layout.addWidget(self.repeat_edit, 1, 3)
+        # Circle parameters
+        config_layout.addWidget(QLabel("半径(m):"), 2, 0)
+        self.radius_edit = QLineEdit("5.0")
+        config_layout.addWidget(self.radius_edit, 2, 1)
+        config_layout.addWidget(QLabel("圈数:"), 2, 2)
+        self.circles_edit = QLineEdit("2")
+        config_layout.addWidget(self.circles_edit, 2, 3)
+        config_layout.addWidget(QLabel("方向:"), 3, 0)
+        self.cw_combo = QComboBox()
+        self.cw_combo.addItems(["逆时针", "顺时针"])
+        config_layout.addWidget(self.cw_combo, 3, 1)
+        # Lock target button
+        self.btnLockTarget = QPushButton("锁定最近目标")
+        self.btnLockTarget.clicked.connect(self._lock_nearest_target)
+        config_layout.addWidget(self.btnLockTarget, 4, 0)
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.btnGen = QPushButton("生成轨迹")
+        self.btnGen.clicked.connect(self._gen_path)
+        btn_layout.addWidget(self.btnGen)
+        self.btnStart = QPushButton("开始跟踪")
+        self.btnStart.clicked.connect(self._start_control)
+        btn_layout.addWidget(self.btnStart)
+        self.btnStop = QPushButton("停止")
+        self.btnStop.clicked.connect(self._stop_car)
+        btn_layout.addWidget(self.btnStop)
+        # Plot widgets
+        self.plotWidget = pg.PlotWidget(title="经纬度轨迹跟踪")
+        self.plotWidget.setLabel('left', '纬度')
+        self.plotWidget.setLabel('bottom', '经度')
+        self.plotWidget.showGrid(x=True, y=True)
+        self.plotWidget.setAspectLocked(True)
+        # Predefine plots for target path, actual path, car marker and target marker
+        self.pathPlot = self.plotWidget.plot([], [], pen=pg.mkPen('b', width=2), name="目标轨迹")
+        self.actualPlot = self.plotWidget.plot([], [], pen=pg.mkPen('g', width=2), name="实际轨迹")
+        self.carMarker = self.plotWidget.plot([], [], pen=None, symbol='o', symbolBrush='r', symbolSize=10,
+                                             name="小车位置")
+        self.targetMarker = self.plotWidget.plot([], [], pen=None, symbol='x', symbolBrush='m', symbolSize=12,
+                                                name="目标点")
+        self.plotWidget.addLegend()
+        # Status labels
+        status_layout = QHBoxLayout()
+        self.statusLabel = QLabel("等待惯导数据…")
+        self.statusLabel.setStyleSheet("font-weight: bold; color: #333;")
+        status_layout.addWidget(self.statusLabel)
+        self.speedLabel = QLabel("速度: 0.0 m/s")
+        status_layout.addWidget(self.speedLabel)
+        self.steerLabel = QLabel("转向: 0.0 rad")
+        status_layout.addWidget(self.steerLabel)
+        self.targetInfoLabel = QLabel("目标: -")
+        status_layout.addWidget(self.targetInfoLabel)
+        # Combine layouts
+        main_layout = QHBoxLayout()
+        left_layout = QVBoxLayout()
+        left_layout.addLayout(config_layout)
+        left_layout.addLayout(btn_layout)
+        left_layout.addWidget(self.plotWidget)
+        left_layout.addLayout(status_layout)
+        main_layout.addLayout(left_layout, 2)
+        main_layout.addWidget(self.radar_plot, 1)
+        self.setLayout(main_layout)
+
+    ###########################################################################
+    # Event handlers and helpers
+    ###########################################################################
+
+    def _on_new_cluster(self, cluster_id: int, dist_x: float, rcs: float) -> None:
+        """
+        Process an incoming radar cluster.  If the cluster distance is below
+        the emergency threshold, trigger an emergency stop.  Otherwise add it
+        to the radar display.
+        """
+        if dist_x <= RADAR_EMERGENCY_DISTANCE:
+            self._emergency_stop("雷达检测到目标 ≤ {:.1f} m".format(RADAR_EMERGENCY_DISTANCE))
+            return
+        self.radar_plot.add_target(dist_x, rcs, cluster_id)
+
+    def _lock_nearest_target(self) -> None:
+        """Lock onto the nearest radar target for tracking."""
+        if self.radar_plot.targets:
+            t = min(self.radar_plot.targets, key=lambda x: abs(x[0]))
+            self.radar_plot.start_tracking(t[0], t[1], t[2])
+
+    def _mode_changed(self, idx: int) -> None:
+        """Update motion mode from combo box selection."""
+        self.mode = 'line' if idx == 0 else 'circle'
+
+    def _gen_path(self) -> None:
+        """Generate path based on current mode and input parameters."""
+        try:
+            if self.mode == 'line':
+                lat1, lon1 = self._get_current_pose()
+                distance = float(self.dist_edit.text())
+                heading = 0.0  # Default heading; could be parameterised
+                repeat = int(self.repeat_edit.text())
+                self.path = generate_line_path_by_distance(
+                    lat1, lon1, distance, heading, repeat=repeat, steps=60
+                )
+                # Compute geofence bounds around this path
+                self._update_geofence_bounds(self.path)
+                # Provide status
+                heading_rad = math.radians(heading)
+                dx = distance * math.sin(heading_rad)
+                dy = distance * math.cos(heading_rad)
+                end_lat, end_lon = geo_offset(lat1, lon1, dx, dy)
+                self.statusLabel.setText(
+                    f"直线轨迹生成: {len(self.path)}点, 终点 ({end_lat:.6f}, {end_lon:.6f})"
+                )
+            else:
+                center_lat, center_lon = self._get_current_pose()
+                radius = float(self.radius_edit.text())
+                circles = int(self.circles_edit.text())
+                cw = self.cw_combo.currentIndex() == 1
+                self.path = generate_circle_path(
+                    (center_lat, center_lon), radius, n_points=100, circles=circles, clockwise=cw
+                )
+                # Compute geofence
+                self._update_geofence_bounds(self.path)
+                self.statusLabel.setText(
+                    f"圆周轨迹生成: {len(self.path)}点, 半径 {radius} m"
+                )
+            # Draw path
+            if self.path:
+                lons = [p[1] for p in self.path]
+                lats = [p[0] for p in self.path]
+                self.pathPlot.setData(lons, lats)
+        except Exception as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+
+    def _update_geofence_bounds(self, path: List[Tuple[float, float]]) -> None:
+        """Compute geofence bounds given a list of (lat, lon) points."""
+        if not path:
+            self.geofence_bounds = None
+            return
+        lats = [p[0] for p in path]
+        lons = [p[1] for p in path]
+        min_lat = min(lats) - GEOFENCE_MARGIN
+        max_lat = max(lats) + GEOFENCE_MARGIN
+        min_lon = min(lons) - GEOFENCE_MARGIN
+        max_lon = max(lons) + GEOFENCE_MARGIN
+        self.geofence_bounds = (min_lat, max_lat, min_lon, max_lon)
+        print(f"Geofence set: lat[{min_lat:.6f}, {max_lat:.6f}], lon[{min_lon:.6f}, {max_lon:.6f}]")
+
+    def _get_current_pose(self) -> Tuple[float, float]:
+        """Return latest latitude and longitude (ignoring yaw/v)."""
+        lat, lon, *_ = self.pose.get_latest()
+        return float(lat), float(lon)
+
+    def _update_plot(self) -> None:
+        """Update actual track and marker positions on the map."""
+        if self.actual_points:
+            actual_lons, actual_lats = zip(*self.actual_points)
+            self.actualPlot.setData(actual_lons, actual_lats)
+        state = self.pose.get_latest()
+        if state:
+            lat, lon, yaw, v = state
+            self.carMarker.setData([lon], [lat])
+            # Show nearest target on path
+            if self.path:
+                min_id = 0
+                min_dist = float('inf')
+                for i, p in enumerate(self.path):
+                    dist = math.hypot(lon - p[1], lat - p[0])
+                    if dist < min_dist:
+                        min_dist = dist
+                        min_id = i
+                target = self.path[min_id]
+                self.targetMarker.setData([target[1]], [target[0]])
+        self.speedLabel.setText(f"速度: {self.car._target_lin:.2f} m/s")
+        self.steerLabel.setText(f"转向: {self.car._target_ang:.2f} rad")
+
+    def _update_radar_plot(self) -> None:
+        """Refresh radar display and update target info label."""
+        self.radar_plot.flush_display()
+        info = self.radar_plot.get_tracked_info()
+        if info:
+            dist, rcs = info
+            self.targetInfoLabel.setText(f"目标: 距离 {dist:.2f} m, RCS {rcs:.2f} dBsm")
+        else:
+            self.targetInfoLabel.setText("目标: -")
+
+    def _start_control(self) -> None:
+        """Start the control loop if not already running."""
+        if not self.path:
+            self._gen_path()
+        if self._active:
+            return
+        self._active = True
+        self.actual_points = []
+        threading.Thread(target=self._control_loop, daemon=True).start()
+
+    def _stop_car(self) -> None:
+        """Stop the control loop and the car."""
+        self._active = False
+        self.car.stop()
+        self.statusLabel.setText("控制已停止")
+
+    def _emergency_stop(self, reason: str) -> None:
+        """Perform an emergency stop with a given reason."""
+        if self._active:
+            self._active = False
+        try:
+            self.car.stop()
+        except Exception:
+            pass
+        self.statusLabel.setText(f"紧急停止: {reason}")
+
+    def _control_loop(self) -> None:
+        """Main loop for trajectory tracking using the Stanley controller."""
+        self.statusLabel.setText("控制已启动…")
+        self.car.enable_can_control()
+        while self._active:
+            lat, lon, yaw, v = self.pose.get_latest()
+            # Record actual track
+            self.actual_points.append((lat, lon))
+            self.actual_points = self.actual_points[-500:]
+            # Geofence check
+            if self.geofence_bounds is not None:
+                min_lat, max_lat, min_lon, max_lon = self.geofence_bounds
+                if lat < min_lat or lat > max_lat or lon < min_lon or lon > max_lon:
+                    self._emergency_stop("超出电子栅栏范围")
+                    break
+            if self.path:
+                steer = stanley_control(lon, lat, math.radians(yaw), v,
+                                         [(p[1], p[0]) for p in self.path])
+                self.car.set_target(0.5, steer)
+                self.statusLabel.setText(
+                    f"控制中: 位置({lat:.6f},{lon:.6f}) 航向:{yaw:.1f}°"
+                )
+            else:
+                self.statusLabel.setText("等待路径生成…")
+            time.sleep(0.1)
+
+    def closeEvent(self, event) -> None:
+        """Handle window close by stopping threads and shutting down."""
+        self._active = False
+        self.car.close()
+        self.radar_thread.running = False
+        event.accept()
+
+
+###############################################################################
+# Main entry point
+###############################################################################
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    win = MainUI()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
